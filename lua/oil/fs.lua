@@ -197,6 +197,81 @@ M.listdir = function(dir, cb)
   end, 10000)
 end
 
+-- Recursive operations would otherwise open every subdirectory at once, and large trees
+-- fail with EMFILE. Directories are read under this limit and closed before recursing.
+local max_open_dirs = 64
+local open_dirs = 0
+local dir_queue = {}
+local dir_queue_head, dir_queue_tail = 1, 0
+
+local function release_dir_slot()
+  local fn = dir_queue[dir_queue_head]
+  if fn then
+    dir_queue[dir_queue_head] = nil
+    dir_queue_head = dir_queue_head + 1
+    fn()
+  else
+    open_dirs = open_dirs - 1
+  end
+end
+
+---@param fn fun()
+local function with_dir_slot(fn)
+  if open_dirs < max_open_dirs then
+    open_dirs = open_dirs + 1
+    fn()
+  else
+    dir_queue_tail = dir_queue_tail + 1
+    dir_queue[dir_queue_tail] = fn
+  end
+end
+
+---@param dir string
+---@param cb fun(err: nil|string, entries: nil|{type: oil.EntryType, name: string}[])
+local function readdir_all(dir, cb)
+  with_dir_slot(function()
+    local all = {}
+    M.listdir(dir, function(err, entries)
+      if err then
+        release_dir_slot()
+        cb(err)
+      elseif entries then
+        vim.list_extend(all, entries)
+      else
+        release_dir_slot()
+        cb(nil, all)
+      end
+    end)
+  end)
+end
+
+---Run fn on all entries concurrently and call cb once, with the first error if any.
+---@param entries {type: oil.EntryType, name: string}[]
+---@param fn fun(entry: {type: oil.EntryType, name: string}, cb: fun(err: nil|string))
+---@param cb fun(err: nil|string)
+local function each_entry(entries, fn, cb)
+  local remaining = #entries
+  if remaining == 0 then
+    return cb()
+  end
+  local failed = false
+  for _, entry in ipairs(entries) do
+    fn(entry, function(err)
+      if failed then
+        return
+      end
+      if err then
+        failed = true
+        return cb(err)
+      end
+      remaining = remaining - 1
+      if remaining == 0 then
+        cb()
+      end
+    end)
+  end
+end
+
 ---@param entry_type oil.EntryType
 ---@param path string
 ---@param cb fun(err: nil|string)
@@ -204,49 +279,20 @@ M.recursive_delete = function(entry_type, path, cb)
   if entry_type ~= "directory" then
     return uv.fs_unlink(path, cb)
   end
-  ---@diagnostic disable-next-line: param-type-mismatch, discard-returns
-  uv.fs_opendir(path, function(open_err, fd)
-    if open_err then
-      return cb(open_err)
+  readdir_all(path, function(read_err, entries)
+    if read_err then
+      return cb(read_err)
     end
-    local failed = false
-    local poll
-    poll = function(inner_cb)
-      uv.fs_readdir(fd, function(err, entries)
-        if err then
-          return inner_cb(err)
-        elseif entries then
-          local waiting = #entries
-          local function complete(err2)
-            if failed then
-              return
-            end
-            if err2 then
-              failed = true
-              return inner_cb(err2)
-            end
-            waiting = waiting - 1
-            if waiting == 0 then
-              poll(inner_cb)
-            end
-          end
-          for _, entry in ipairs(entries) do
-            M.recursive_delete(entry.type, path .. M.sep .. entry.name, complete)
-          end
-        else
-          inner_cb()
-        end
-      end)
-    end
-    poll(function(err)
-      uv.fs_closedir(fd)
+    assert(entries)
+    each_entry(entries, function(entry, entry_cb)
+      M.recursive_delete(entry.type, path .. M.sep .. entry.name, entry_cb)
+    end, function(err)
       if err then
         return cb(err)
       end
       uv.fs_rmdir(path, cb)
     end)
-    ---@diagnostic disable-next-line: param-type-mismatch
-  end, 10000)
+  end)
 end
 
 ---Move the undofile for the file at src_path to dest_path
@@ -309,48 +355,20 @@ M.recursive_copy = function(entry_type, src_path, dest_path, cb)
       if mkdir_err then
         return cb(mkdir_err)
       end
-      ---@diagnostic disable-next-line: param-type-mismatch, discard-returns
-      uv.fs_opendir(src_path, function(open_err, fd)
-        if open_err then
-          return cb(open_err)
+      readdir_all(src_path, function(read_err, entries)
+        if read_err then
+          return cb(read_err)
         end
-        local failed = false
-        local poll
-        poll = function(inner_cb)
-          uv.fs_readdir(fd, function(err, entries)
-            if err then
-              return inner_cb(err)
-            elseif entries then
-              local waiting = #entries
-              local function complete(err2)
-                if failed then
-                  return
-                end
-                if err2 then
-                  failed = true
-                  return inner_cb(err2)
-                end
-                waiting = waiting - 1
-                if waiting == 0 then
-                  poll(inner_cb)
-                end
-              end
-              for _, entry in ipairs(entries) do
-                M.recursive_copy(
-                  entry.type,
-                  src_path .. M.sep .. entry.name,
-                  dest_path .. M.sep .. entry.name,
-                  complete
-                )
-              end
-            else
-              inner_cb()
-            end
-          end)
-        end
-        poll(cb)
-        ---@diagnostic disable-next-line: param-type-mismatch
-      end, 10000)
+        assert(entries)
+        each_entry(entries, function(entry, entry_cb)
+          M.recursive_copy(
+            entry.type,
+            src_path .. M.sep .. entry.name,
+            dest_path .. M.sep .. entry.name,
+            entry_cb
+          )
+        end, cb)
+      end)
     end)
   end)
 end
